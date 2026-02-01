@@ -1,0 +1,13 @@
+{
+  "name": "trashcan",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@elysiajs/html": "^1.0.9",
+    "elysia": "^1.0.21",
+    "sanitize-html": "^2.13.0"
+  }
+}
