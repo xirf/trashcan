@@ -3,11 +3,15 @@ import { html } from "@elysiajs/html";
 import { randomBytes, createHash } from "crypto";
 import sanitizeHtml from "sanitize-html";
 import { db } from "./db/schema";
+import { verifyTurnstile } from "./turnstile";
 
 const SESSION_COOKIE = "session_id";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
 const RATE_LIMIT_WINDOW_MINUTES = 5;
 const DAILY_SALT = new Date().toISOString().slice(0, 10);
+const TURNSTILE_SITE_KEY =
+  process.env.TURNSTILE_SITE_KEY || "1x00000000000000000000AA";
+const PAGE_SIZE = 10;
 
 const app = new Elysia()
   .use(html())
@@ -50,17 +54,31 @@ const app = new Elysia()
     }
   )
   .get("/", ({ set, html, isAdmin }) => {
-    const posts = db
-      .query<Post>(
-        "SELECT * FROM posts WHERE status='active' ORDER BY datetime(created_at) DESC"
-      )
-      .all();
+    const { posts, hasMore } = fetchPosts(0, PAGE_SIZE);
     set.headers["Content-Type"] = "text/html; charset=utf-8";
-    return html(renderPage(posts, isAdmin));
+    return html(renderPage(posts, isAdmin, hasMore, PAGE_SIZE));
   })
+  .get(
+    "/feed",
+    ({ set, isAdmin, query }) => {
+      const offset = Number(query?.offset ?? 0) || 0;
+      const { posts, hasMore } = fetchPosts(offset, PAGE_SIZE);
+      set.headers["Content-Type"] = "text/html; charset=utf-8";
+      return renderFeedChunk(posts, isAdmin, offset + PAGE_SIZE, hasMore);
+    },
+    {
+      query: t.Object({
+        offset: t.Optional(t.Numeric()),
+      }),
+    }
+  )
   .post(
     "/post",
-    ({ body, session, ipHash, set }) => {
+    async ({ body, session, ipHash, set }) => {
+      if (!(await verifyTurnstile(body?.cf_turnstile_response))) {
+        set.status = 400;
+        return { error: "Turnstile failed" };
+      }
       const text = sanitize(body?.text || "");
       if (!text.trim()) {
         set.status = 400;
@@ -74,11 +92,13 @@ const app = new Elysia()
         "INSERT INTO posts (body, session_id, ip_hash, status) VALUES (?1, ?2, ?3, 'active')"
       ).run(text, session, ipHash);
       db.query("INSERT INTO rate_limits (ip_hash) VALUES (?1)").run(ipHash);
-      return { ok: true };
+      const refreshed = fetchPosts(0, PAGE_SIZE);
+      return renderFeed(refreshed.posts, isAdmin);
     },
     {
       body: t.Object({
         text: t.String(),
+        cf_turnstile_response: t.String(),
       }),
     }
   )
@@ -170,20 +190,30 @@ function isRateLimited(ipHash: string) {
   return row.count > 0;
 }
 
-function renderPage(posts: Post[], isAdmin: boolean) {
+function renderPage(
+  posts: Post[],
+  isAdmin: boolean,
+  hasMore: boolean,
+  nextOffset: number
+) {
   const banner =
     '<div class="bg-red-100 text-red-900 p-3 rounded mb-4 text-sm">If you are struggling, please seek help. Share kindly and avoid harmful content.</div>';
-  const form = `<form hx-post="/post" hx-trigger="submit" hx-target="#feed" hx-swap="outerHTML">
+  const form = `<form hx-post="/post" hx-trigger="submit" hx-target="#feed" hx-swap="outerHTML" class="space-y-2">
     <textarea name="text" class="w-full border p-2 rounded mb-2" rows="3" placeholder="Share your thoughts..."></textarea>
+    <div class="cf-turnstile" data-sitekey="${TURNSTILE_SITE_KEY}"></div>
     <button class="bg-blue-600 text-white px-4 py-2 rounded" type="submit">Post</button>
   </form>`;
   const feed = renderFeed(posts, isAdmin);
+  const more = hasMore
+    ? renderMorePlaceholder(nextOffset)
+    : `<div id="feed-more" class="text-center text-sm text-slate-400 my-4">No more posts</div>`;
   return `<!doctype html>
   <html>
     <head>
       <meta charset="utf-8" />
       <title>Anon Vent</title>
       <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+      <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
       <link href="https://cdn.jsdelivr.net/npm/tailwindcss@3.4.1/dist/tailwind.min.css" rel="stylesheet">
     </head>
     <body class="bg-slate-100 text-slate-900">
@@ -192,6 +222,7 @@ function renderPage(posts: Post[], isAdmin: boolean) {
         ${banner}
         ${form}
         <div id="feed">${feed}</div>
+        ${more}
       </div>
     </body>
   </html>`;
@@ -219,6 +250,34 @@ function renderFeed(posts: Post[], isAdmin: boolean) {
       </div>`;
     })
     .join("");
+}
+
+function renderFeedChunk(
+  posts: Post[],
+  isAdmin: boolean,
+  nextOffset: number,
+  hasMore: boolean
+) {
+  const content = renderFeed(posts, isAdmin);
+  const more = hasMore
+    ? renderMorePlaceholder(nextOffset)
+    : `<div id="feed-more" class="text-center text-sm text-slate-400 my-4">No more posts</div>`;
+  return `${content}${more}`;
+}
+
+function renderMorePlaceholder(nextOffset: number) {
+  return `<div id="feed-more" hx-get="/feed?offset=${nextOffset}" hx-trigger="revealed" hx-swap="outerHTML"></div>`;
+}
+
+function fetchPosts(offset: number, limit: number) {
+  const rows = db
+    .query<Post>(
+      "SELECT * FROM posts WHERE status='active' ORDER BY datetime(created_at) DESC LIMIT ?1 OFFSET ?2"
+    )
+    .all(limit + 1, offset);
+  const posts = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
+  return { posts, hasMore };
 }
 
 function renderAdmin(posts: Post[]) {
